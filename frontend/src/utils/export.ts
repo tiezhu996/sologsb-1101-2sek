@@ -6,6 +6,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { LayerRevision } from '@/types/layerRevision'
 
 /** 校验备份对象的必备字段，返回错误信息数组（为空表示通过） */
 export function validateBackup(input: unknown): { ok: boolean; errors: string[]; payload: BackupPayload | null } {
@@ -15,17 +16,17 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   }
   const obj = input as Partial<BackupPayload>
   if (obj.app !== 'gbmuralarch') errors.push('app 字段应为 gbmuralarch，文件来源不明')
-  const collections: Array<keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>> = [
-    'halls',
-    'elements',
-    'layers',
-    'decays',
-    'repairSteps'
-  ]
+  const collections: Array<keyof Pick<
+    BackupPayload,
+    'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'
+  >> = ['halls', 'elements', 'layers', 'decays', 'repairSteps']
   for (const key of collections) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
+  // layerRevisions 为 v3 新增：v2 及更早的备份没有该字段，按空数组兼容导入，
+  // 旧档在本版本内重新做的层位校订同样会随下一次导出带上校订关系。
+  const layerRevisions = Array.isArray(obj.layerRevisions) ? (obj.layerRevisions as LayerRevision[]) : []
   const payload: BackupPayload = {
     app: 'gbmuralarch',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
@@ -34,19 +35,21 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    repairSteps: obj.repairSteps ?? [],
+    layerRevisions
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
+  const [halls, elements, layers, decays, repairSteps, layerRevisions] = await Promise.all([
     db.halls.toArray(),
     db.elements.toArray(),
     db.layers.toArray(),
     db.decays.toArray(),
-    db.repairSteps.toArray()
+    db.repairSteps.toArray(),
+    db.layerRevisions.toArray()
   ])
   return {
     app: 'gbmuralarch',
@@ -56,7 +59,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    layerRevisions
   }
 }
 
@@ -81,7 +85,8 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      layerRevisions: payload.layerRevisions.length
     }
   }
 }
@@ -104,13 +109,14 @@ export async function importBackup(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.layerRevisions],
     async () => {
       await db.halls.bulkPut(payload.halls)
       await db.elements.bulkPut(payload.elements)
       await db.layers.bulkPut(payload.layers)
       await db.decays.bulkPut(payload.decays)
       await db.repairSteps.bulkPut(payload.repairSteps)
+      await db.layerRevisions.bulkPut(payload.layerRevisions)
     }
   )
   return {
@@ -118,7 +124,8 @@ export async function importBackup(
     elements: payload.elements.length,
     layers: payload.layers.length,
     decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    repairSteps: payload.repairSteps.length,
+    layerRevisions: payload.layerRevisions.length
   }
 }
 
@@ -154,7 +161,35 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('step'),
     decayId: decayIdMap.get(step.decayId) ?? step.decayId
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+  // 校订关系一并随行：内部所有构件 / 层位 / 病害主键都要按上面的映射改写。
+  // 草稿校订里新拆出的层位 id 是预分配的、尚未进 layers 表，需要在这里补一份映射，
+  // 保证 resultLayers 与 decayAssignments.targetLayerId 指向同一个新 id。
+  const layerRevisions = payload.layerRevisions.map((revision) => {
+    const draftLayerIdMap = new Map<string, string>()
+    revision.resultLayers.forEach((result) => {
+      if (!layerIdMap.has(result.id)) draftLayerIdMap.set(result.id, createId('lay'))
+    })
+    const mapLayerId = (id: string): string => layerIdMap.get(id) ?? draftLayerIdMap.get(id) ?? id
+    return {
+      ...revision,
+      id: createId('rev'),
+      elementId: elementIdMap.get(revision.elementId) ?? revision.elementId,
+      sourceLayerId: revision.sourceLayerId ? mapLayerId(revision.sourceLayerId) : null,
+      sourceLayerIds: revision.sourceLayerIds.map(mapLayerId),
+      sourceSnapshots: revision.sourceSnapshots.map((snapshot) => ({
+        ...snapshot,
+        layerId: mapLayerId(snapshot.layerId)
+      })),
+      resultLayers: revision.resultLayers.map((result) => ({ ...result, id: mapLayerId(result.id) })),
+      decayAssignments: revision.decayAssignments.map((assignment) => ({
+        ...assignment,
+        decayId: decayIdMap.get(assignment.decayId) ?? assignment.decayId,
+        fromLayerId: mapLayerId(assignment.fromLayerId),
+        targetLayerId: assignment.targetLayerId ? mapLayerId(assignment.targetLayerId) : null
+      }))
+    }
+  })
+  return { ...payload, halls, elements, layers, decays, repairSteps, layerRevisions }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */

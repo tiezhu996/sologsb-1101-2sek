@@ -4,9 +4,10 @@ import type { Element } from '@/types/element'
 import type { PaintLayer } from '@/types/layer'
 import type { Decay } from '@/types/decay'
 import type { RepairStep } from '@/types/repair'
+import type { LayerRevision } from '@/types/layerRevision'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -35,6 +36,8 @@ export interface BackupPayload {
   layers: PaintLayer[]
   decays: Decay[]
   repairSteps: RepairStep[]
+  /** 层位校订记录（v3 起）；旧版备份缺失时按空数组导入，保持兼容 */
+  layerRevisions: LayerRevision[]
 }
 
 export class MuralArchDatabase extends Dexie {
@@ -43,6 +46,7 @@ export class MuralArchDatabase extends Dexie {
   layers!: Table<PaintLayer, string>
   decays!: Table<Decay, string>
   repairSteps!: Table<RepairStep, string>
+  layerRevisions!: Table<LayerRevision, string>
 
   constructor() {
     super('gbmuralarch')
@@ -76,6 +80,16 @@ export class MuralArchDatabase extends Dexie {
             }
           })
       })
+    // v3：新增 layerRevisions 表，承载层位拆分 / 合并校订及其病害归属关系。
+    // 旧档无此表，Dexie 自动建空表，不需要数据回填；既有 layers/decays 记录原样保留。
+    this.version(DB_VERSION).stores({
+      halls: 'id, name, era, structureType, roofType, updatedAt',
+      elements: 'id, hallId, position, status, updatedAt',
+      layers: 'id, elementId, level, patternName, pigment',
+      decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
+      repairSteps: 'id, decayId, seq, name, state, updatedAt',
+      layerRevisions: 'id, elementId, kind, status, updatedAt'
+    })
   }
 }
 
@@ -91,14 +105,15 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.layerRevisions],
     async () => {
       await Promise.all([
         db.halls.clear(),
         db.elements.clear(),
         db.layers.clear(),
         db.decays.clear(),
-        db.repairSteps.clear()
+        db.repairSteps.clear(),
+        db.layerRevisions.clear()
       ])
     }
   )

@@ -136,10 +136,17 @@ export const useHallStore = defineStore('hall', () => {
   async function removeLayer(id: string): Promise<void> {
     const layer = layers.value.find((item) => item.id === id)
     const decayIds = decays.value.filter((decay) => decay.layerId === id).map((decay) => decay.id)
-    await db.transaction('rw', [db.layers, db.decays, db.repairSteps], async () => {
+    await db.transaction('rw', [db.layers, db.decays, db.repairSteps, db.layerRevisions], async () => {
       await db.repairSteps.where('decayId').anyOf(decayIds).delete()
       await db.decays.bulkDelete(decayIds)
       await db.layers.delete(id)
+      // 引用该层的待生效校订随删除失效；已生效校订保留快照供溯源，仅摘除已不存在的源层引用
+      const drafts = await db.layerRevisions
+        .where('status')
+        .equals('draft')
+        .filter((revision) => revision.sourceLayerIds.includes(id))
+        .primaryKeys()
+      await db.layerRevisions.bulkDelete(drafts)
     })
     if (layer) await syncLayerCount(layer.elementId)
   }
@@ -150,11 +157,12 @@ export const useHallStore = defineStore('hall', () => {
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.elements, db.layers, db.decays, db.repairSteps],
+      [db.elements, db.layers, db.decays, db.repairSteps, db.layerRevisions],
       async () => {
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)
+        await db.layerRevisions.where('elementId').equals(id).delete()
         await db.elements.delete(id)
       }
     )
@@ -194,11 +202,16 @@ export const useHallStore = defineStore('hall', () => {
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+      [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.layerRevisions],
       async () => {
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)
+        const revisionKeys = await db.layerRevisions
+          .where('elementId')
+          .anyOf(elementIds)
+          .primaryKeys()
+        await db.layerRevisions.bulkDelete(revisionKeys)
         await db.elements.bulkDelete(elementIds)
         await db.halls.delete(id)
       }

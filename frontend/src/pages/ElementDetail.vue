@@ -3,20 +3,25 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import type { TreeNodeData } from 'element-plus/es/components/tree/src/tree.type'
-import { ArrowLeft, Delete, Edit, Plus, Warning } from '@element-plus/icons-vue'
+import { ArrowLeft, Connection, Delete, Edit, Plus, Scissor, Warning } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import RevisionDialog from '@/components/layer/RevisionDialog.vue'
+import RevisionPanel from '@/components/layer/RevisionPanel.vue'
 import { useHallStore } from '@/stores/hallStore'
 import { useDecayStore } from '@/stores/decayStore'
+import { useRevisionStore } from '@/stores/revisionStore'
 import { ELEMENT_POSITIONS, ELEMENT_STATUSES, type Element, type ElementPosition, type ElementStatus } from '@/types/element'
 import { PATTERN_NAMES, PIGMENTS, type PaintLayer, type PatternName, type Pigment } from '@/types/layer'
 import { DECAY_TYPES, SEVERITIES, type Decay, type DecayType, type Severity } from '@/types/decay'
+import type { LayerRevision, RevisionKind } from '@/types/layerRevision'
 
 const route = useRoute()
 const router = useRouter()
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
+const revisionStore = useRevisionStore()
 
 const hallId = computed(() => String(route.params.id ?? ''))
 const hall = computed(() => hallStore.hallById(hallId.value) ?? null)
@@ -31,6 +36,14 @@ const layerDialogVisible = ref(false)
 const decayDialogVisible = ref(false)
 const editingElementId = ref<string | null>(null)
 const editingLayerId = ref<string | null>(null)
+
+/** 层位校订对话框 */
+const revisionVisible = ref(false)
+const revisionMode = ref<RevisionKind>('split')
+const revisionSourceIds = ref<string[]>([])
+const revisionId = ref<string | null>(null)
+/** 层位表格勾选（用于合并相邻两层） */
+const selectedLayerRows = ref<PaintLayer[]>([])
 
 const elementFormRef = ref<FormInstance>()
 const layerFormRef = ref<FormInstance>()
@@ -203,6 +216,65 @@ function handleTreeClick(data: TreeNodeData): void {
 function handleExpandChange(_row: PaintLayer, expanded: PaintLayer[]): void {
   expandedLayerIds.value = expanded.map((item) => item.id)
 }
+
+function handleLayerSelectionChange(rows: PaintLayer[]): void {
+  selectedLayerRows.value = rows
+}
+
+/** 当前构件是否存在待生效校订草稿：存在时禁止再发起新的拆分 / 合并 */
+const hasOpenRevision = computed(() => Boolean(revisionStore.draftOfElement(selectedId.value)))
+
+function openSplitRevision(layer: PaintLayer): void {
+  if (hasOpenRevision.value) {
+    ElMessage.warning('该构件已有待生效校订，请先继续处理或放弃后再发起')
+    return
+  }
+  revisionMode.value = 'split'
+  revisionSourceIds.value = [layer.id]
+  revisionId.value = null
+  revisionVisible.value = true
+}
+
+function openMergeRevision(): void {
+  if (!selectedElement.value) return
+  if (hasOpenRevision.value) {
+    ElMessage.warning('该构件已有待生效校订，请先继续处理或放弃后再发起')
+    return
+  }
+  const picked = [...selectedLayerRows.value].sort((a, b) => a.level - b.level)
+  if (picked.length !== 2) {
+    ElMessage.warning('请在层位表中勾选两个层位再合并')
+    return
+  }
+  if (Math.abs(picked[0].level - picked[1].level) !== 1) {
+    ElMessage.warning('只有由外至内相邻的两层才可合并为同一遍')
+    return
+  }
+  revisionMode.value = 'merge'
+  revisionSourceIds.value = picked.map((layer) => layer.id)
+  revisionId.value = null
+  revisionVisible.value = true
+}
+
+function resumeRevision(revision: LayerRevision): void {
+  revisionMode.value = revision.kind
+  revisionSourceIds.value = [...revision.sourceLayerIds]
+  revisionId.value = revision.id
+  revisionVisible.value = true
+}
+
+function handleRevisionApplied(): void {
+  // liveQuery 会自动刷新层位 / 病害；这里清空勾选并强制重建表格展开态
+  selectedLayerRows.value = []
+  expandedLayerIds.value = []
+  layerTableKey.value += 1
+}
+
+const mergeSelectionValid = computed(() => {
+  if (selectedLayerRows.value.length !== 2) return false
+  const [a, b] = [...selectedLayerRows.value].sort((x, y) => x.level - y.level)
+  return b.level - a.level === 1
+})
 
 function openElementDialog(element?: Element): void {
   if (element) {
@@ -513,8 +585,28 @@ const severityOptions = SEVERITIES
             <div class="section-card">
               <div class="section-card__head">
                 <h3>彩画层位</h3>
-                <el-button type="primary" size="small" :icon="Plus" @click="openLayerDialog()">新增层位</el-button>
+                <div class="layer-head-actions">
+                  <el-button
+                    size="small"
+                    :icon="Connection"
+                    :disabled="!selectedElement || hasOpenRevision || !mergeSelectionValid"
+                    @click="openMergeRevision"
+                  >
+                    合并勾选两层为同一遍
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    size="small"
+                    :icon="Plus"
+                    :disabled="hasOpenRevision"
+                    @click="openLayerDialog()"
+                  >
+                    新增层位
+                  </el-button>
+                </div>
               </div>
+
+              <RevisionPanel :element-id="selectedElement?.id ?? ''" @resume="resumeRevision" />
 
               <el-table
                 :key="layerTableKey"
@@ -522,7 +614,9 @@ const severityOptions = SEVERITIES
                 row-key="id"
                 :expand-row-keys="expandedLayerIds"
                 @expand-change="handleExpandChange"
+                @selection-change="handleLayerSelectionChange"
               >
+                <el-table-column type="selection" width="42" :selectable="() => !hasOpenRevision" />
                 <el-table-column type="expand">
                   <template #default="{ row }">
                     <div class="layer-decays">
@@ -584,11 +678,21 @@ const severityOptions = SEVERITIES
                     <span class="mono">{{ layerDecays(row.id).length }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" width="200">
+                <el-table-column label="操作" width="260">
                   <template #default="{ row }">
                     <el-button size="small" :icon="Edit" text @click="openLayerDialog(row)">编辑</el-button>
                     <el-button size="small" type="primary" text :icon="Warning" @click="openDecayDialog(row.id)">
                       挂接病害
+                    </el-button>
+                    <el-button
+                      size="small"
+                      type="warning"
+                      text
+                      :icon="Scissor"
+                      :disabled="hasOpenRevision"
+                      @click="openSplitRevision(row)"
+                    >
+                      拆分校订
                     </el-button>
                     <el-button size="small" type="danger" text @click="removeLayer(row)">删除</el-button>
                   </template>
@@ -659,8 +763,16 @@ const severityOptions = SEVERITIES
       </template>
     </el-dialog>
 
-    <el-dialog v-model="decayDialogVisible" title="挂接病害记录" width="540px">
-      <el-form ref="decayFormRef" :model="decayForm" :rules="decayRules" label-width="110px">
+    <RevisionDialog
+      v-model="revisionVisible"
+      :mode="revisionMode"
+      :element-id="selectedElement?.id ?? ''"
+      :source-ids="revisionSourceIds"
+      :revision-id="revisionId"
+      @applied="handleRevisionApplied"
+    />
+
+    <el-dialog v-model="decayDialogVisible" title="挂接病害记录" width="540px">      <el-form ref="decayFormRef" :model="decayForm" :rules="decayRules" label-width="110px">
         <el-form-item label="病害类型" prop="type">
           <el-select v-model="decayForm.type" class="full-width">
             <el-option v-for="item in decayTypeOptions" :key="item" :label="item" :value="item" />
@@ -731,6 +843,12 @@ const severityOptions = SEVERITIES
 .element-actions {
   display: flex;
   gap: 6px;
+}
+
+.layer-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .element-status {

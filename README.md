@@ -42,7 +42,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 语言 | TypeScript（`strict: true`，无 `any`） | `npm run build` 内含 `vue-tsc --noEmit` 类型检查 |
 | UI 组件库 | Element Plus 2.x（含 `@element-plus/icons-vue`） | 表格、树、表单、对话框、时间线交互 |
 | 构建工具 | Vite 6 | 开发服务器端口 21801 |
-| 状态管理 | Pinia（setup store） | `hallStore` / `decayStore` / `repairStore` |
+| 状态管理 | Pinia（setup store） | `hallStore` / `decayStore` / `repairStore` / `revisionStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
 | 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与升级迁移逻辑 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
@@ -68,7 +68,7 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/halls` | 殿宇总览 | 新建殿宇、按年代与结构类型筛选，卡片回显病害总数与未修复数 | Hall、Element、PaintLayer、Decay |
-| `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位，挂接病害 | Element、PaintLayer、Decay |
+| `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位、挂接病害，发起拆分 / 合并层位校订并查看校订履历 | Element、PaintLayer、Decay、LayerRevision |
 | `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型 | Decay、PaintLayer |
 | `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复 | RepairStep、Decay |
 | `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出、清空与样例数据 | 全部模型 |
@@ -86,8 +86,12 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | PaintLayer 彩画层位 | `src/types/layer.ts` | `id` `elementId` `level`（由外至内） `patternName`（旋子/和玺/苏式） `pigment`（石青/石绿/朱砂/土黄） `thicknessMm` | 层位顺次叠压 |
 | Decay 病害记录 | `src/types/decay.ts` | `id` `layerId` `type`（起甲/剥落/空鼓/粉化/龟裂） `severity`（轻度/中度/重度） `areaCm2` `causeGuess` `repaired` | 同层位可叠加多条并汇总到殿宇 |
 | RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） | 拖拽排序，完成回写病害 |
+| LayerRevision 层位校订 | `src/types/layerRevision.ts` | `id` `elementId` `kind`（split拆分/merge合并） `status`（draft待生效/applied已生效） `sourceSnapshots` `resultLayers` `decayAssignments`（逐条病害归属，`targetLayerId=null` 即待复核） | 病害与工序始终按「遍」（层主键）指向，校订单事务一次性生效 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：
+
+- v2：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+- v3：新增 `layerRevisions` 表，承载层位拆分 / 合并校订及其病害归属关系；旧档（v1/v2）无此表时自动建空表，既有数据原样可用，在新版本内做过校订后，导出的备份会带上完整校订关系。
 
 ---
 
@@ -97,9 +101,11 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 sologsb-1101/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts
-│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts
+│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts layerRevision.ts
+│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts revisionStore.ts
 │   │   ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+│   │   ├── components/layer/     # RevisionDialog.vue RevisionPanel.vue
+│   │   ├── services/             # layerRevisionService.ts（校订草稿、校验、单事务生效）
 │   │   ├── hooks/                # useDecayFilter.ts useIdbTable.ts
 │   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue BackupView.vue
 │   │   ├── router/               # index.ts
@@ -122,9 +128,10 @@ sologsb-1101/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：5 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：6 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps` / `layerRevisions`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
 - **localStorage**：仅存元数据 —— `gbmuralarch:db-version`（本地结构版本）、`gbmuralarch:last-backup-at`（最近一次导出时间）、`gbmuralarch:ui-prefs`（当前选中殿宇、工序排序方式）。
-- **备份**：`/backup` 页面可导出 JSON（含 5 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
+- **备份**：`/backup` 页面可导出 JSON（含 6 张表全量数据与结构版本，校订关系随备份携带），导入时先校验 `app` 字段与各集合数组完整性；`layerRevisions` 为 v3 新增集合，v2 旧备份缺失时按空数组兼容导入；支持「覆盖导入」与「追加导入（重新分配 id，校订记录内部所有构件 / 层位 / 病害引用一并重映射）」两种模式。
+- **层位校订（拆分 / 合并）**：构件页层位表可发起「拆分校订」（一层实为两遍叠压）或勾选两个相邻层位「合并为同一遍」。病害记录与修复工序始终指向「原来的那遍画」（层主键）而非层号——拆分时原遍沿用原层主键、新遍预分配新主键，病害逐条定遍（默认留原遍）；合并时保留一层，病害改挂保留层，工序只认 `decayId` 故自动跟随。归属存疑的病害放入待复核区（`targetLayerId=null`，记录原层快照与原工序链可查），待复核清空前不可生效；校订为草稿制，全部写入（层位增改删、病害改挂、层位重排、构件层数回写、记录置为 applied）在**同一个 Dexie 事务**内一次性完成，失败整体回滚、不留半套结果，可原样重试。同一构件同一时刻仅允许一份待生效草稿。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---
