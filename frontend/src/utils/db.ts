@@ -4,9 +4,10 @@ import type { Element } from '@/types/element'
 import type { PaintLayer } from '@/types/layer'
 import type { Decay } from '@/types/decay'
 import type { RepairStep } from '@/types/repair'
+import type { LayerCorrection } from '@/types/correction'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -35,6 +36,8 @@ export interface BackupPayload {
   layers: PaintLayer[]
   decays: Decay[]
   repairSteps: RepairStep[]
+  /** 层位校订关系（v3 起随备份导出；旧版本备份缺省为空数组） */
+  corrections: LayerCorrection[]
 }
 
 export class MuralArchDatabase extends Dexie {
@@ -43,6 +46,7 @@ export class MuralArchDatabase extends Dexie {
   layers!: Table<PaintLayer, string>
   decays!: Table<Decay, string>
   repairSteps!: Table<RepairStep, string>
+  corrections!: Table<LayerCorrection, string>
 
   constructor() {
     super('gbmuralarch')
@@ -54,7 +58,7 @@ export class MuralArchDatabase extends Dexie {
       repairSteps: 'id, decayId, seq, state, updatedAt'
     })
     // v2：病害表补充 repairedAt 索引，工序表补充 name 索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         halls: 'id, name, era, structureType, roofType, updatedAt',
         elements: 'id, hallId, position, status, updatedAt',
@@ -76,6 +80,15 @@ export class MuralArchDatabase extends Dexie {
             }
           })
       })
+    // v3：新增层位校订表 corrections（拆分 / 合并的暂存与生效记录）
+    this.version(DB_VERSION).stores({
+      halls: 'id, name, era, structureType, roofType, updatedAt',
+      elements: 'id, hallId, position, status, updatedAt',
+      layers: 'id, elementId, level, patternName, pigment',
+      decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
+      repairSteps: 'id, decayId, seq, name, state, updatedAt',
+      corrections: 'id, elementId, kind, status, updatedAt'
+    })
   }
 }
 
@@ -91,14 +104,15 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.corrections],
     async () => {
       await Promise.all([
         db.halls.clear(),
         db.elements.clear(),
         db.layers.clear(),
         db.decays.clear(),
-        db.repairSteps.clear()
+        db.repairSteps.clear(),
+        db.corrections.clear()
       ])
     }
   )

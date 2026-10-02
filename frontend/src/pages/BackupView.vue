@@ -7,6 +7,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useHallStore } from '@/stores/hallStore'
 import { useDecayStore } from '@/stores/decayStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useCorrectionStore } from '@/stores/correctionStore'
 import {
   DB_VERSION,
   clearAllTables,
@@ -27,6 +28,7 @@ import { formatArea } from '@/utils/severity'
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const correctionStore = useCorrectionStore()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const importOverwrite = ref(true)
@@ -47,7 +49,8 @@ const counts = computed(() => ({
   elements: hallStore.elements.length,
   layers: hallStore.layers.length,
   decays: decayStore.decays.length,
-  repairSteps: repairStore.steps.length
+  repairSteps: repairStore.steps.length,
+  corrections: correctionStore.corrections.length
 }))
 
 const storageRows = computed(() => [
@@ -59,7 +62,12 @@ const storageRows = computed(() => [
     key: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
     count: counts.value.decays
   },
-  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps }
+  { table: 'repairSteps（工序）', key: 'id, decayId, seq, name, state, updatedAt', count: counts.value.repairSteps },
+  {
+    table: 'corrections（层位校订）',
+    key: 'id, elementId, kind, status, updatedAt',
+    count: counts.value.corrections
+  }
 ])
 
 const localStorageRows = computed(() => [
@@ -76,7 +84,7 @@ async function doExport(): Promise<void> {
     const result = await exportBackupJson()
     lastBackupAt.value = readLastBackupAt()
     ElMessage.success(
-      `已导出 ${result.fileName}（殿宇 ${result.counts.halls} / 构件 ${result.counts.elements} / 层位 ${result.counts.layers} / 病害 ${result.counts.decays} / 工序 ${result.counts.repairSteps}）`
+      `已导出 ${result.fileName}（殿宇 ${result.counts.halls} / 构件 ${result.counts.elements} / 层位 ${result.counts.layers} / 病害 ${result.counts.decays} / 工序 ${result.counts.repairSteps} / 校订 ${result.counts.corrections}）`
     )
   } finally {
     exporting.value = false
@@ -126,7 +134,7 @@ async function confirmImport(): Promise<void> {
     if (!confirmed) return
     const result = await importBackup(payload, importOverwrite.value)
     ElMessage.success(
-      `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps}`
+      `导入完成：殿宇 ${result.halls} / 构件 ${result.elements} / 层位 ${result.layers} / 病害 ${result.decays} / 工序 ${result.repairSteps} / 校订 ${result.corrections}`
     )
     importPreview.value = null
   } finally {
@@ -153,16 +161,23 @@ async function doSeed(): Promise<void> {
   ElMessage.success('已生成本地样例档案')
 }
 
-function previewCount(payload: BackupPayload, key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>): number {
+function previewCount(
+  payload: BackupPayload,
+  key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'corrections'>
+): number {
   return payload[key].length
 }
 
-const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>; label: string }> = [
+const previewKeys: Array<{
+  key: keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'corrections'>
+  label: string
+}> = [
   { key: 'halls', label: '殿宇' },
   { key: 'elements', label: '构件' },
   { key: 'layers', label: '层位' },
   { key: 'decays', label: '病害' },
-  { key: 'repairSteps', label: '工序' }
+  { key: 'repairSteps', label: '工序' },
+  { key: 'corrections', label: '校订' }
 ]
 </script>
 
@@ -188,6 +203,7 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
       <StatBadge label="彩画层位" :value="counts.layers" suffix="层" icon="Files" />
       <StatBadge label="病害记录" :value="counts.decays" suffix="条" icon="Histogram" tone="warning" />
       <StatBadge label="工序" :value="counts.repairSteps" suffix="道" icon="Tools" tone="success" />
+      <StatBadge label="层位校订" :value="counts.corrections" suffix="条" icon="Files" tone="info" />
       <StatBadge label="病害总面积" :value="formatArea(decayStore.totalArea)" icon="PieChart" />
     </div>
 
@@ -215,6 +231,7 @@ const previewKeys: Array<{ key: keyof Pick<BackupPayload, 'halls' | 'elements' |
       </el-table>
       <p class="muted storage-note">
         版本 1 → 2 的迁移：decays 表补充 repairedAt 索引，修复状态字段缺失的历史数据按 updatedAt 回填。
+        版本 2 → 3 的迁移：新增 corrections 层位校订表；旧版本备份（无 corrections 字段）导入时按当前结构兼容升级。
       </p>
     </div>
 

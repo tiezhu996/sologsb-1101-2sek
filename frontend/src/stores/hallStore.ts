@@ -144,17 +144,18 @@ export const useHallStore = defineStore('hall', () => {
     if (layer) await syncLayerCount(layer.elementId)
   }
 
-  /** 级联删除构件及其层位、病害、工序 */
+  /** 级联删除构件及其层位、病害、工序、校订记录 */
   async function removeElement(id: string): Promise<void> {
     const layerIds = layersOfElement(id).map((layer) => layer.id)
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.elements, db.layers, db.decays, db.repairSteps],
+      [db.elements, db.layers, db.decays, db.repairSteps, db.corrections],
       async () => {
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)
+        await db.corrections.where('elementId').equals(id).delete()
         await db.elements.delete(id)
       }
     )
@@ -185,7 +186,7 @@ export const useHallStore = defineStore('hall', () => {
     await hallsTable.update(id, patch)
   }
 
-  /** 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序 */
+  /** 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序 → 校订记录 */
   async function removeHall(id: string): Promise<void> {
     const elementIds = elements.value.filter((element) => element.hallId === id).map((element) => element.id)
     const layerIds = layers.value
@@ -194,11 +195,12 @@ export const useHallStore = defineStore('hall', () => {
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+      [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.corrections],
       async () => {
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)
+        await db.corrections.where('elementId').anyOf(elementIds).delete()
         await db.elements.bulkDelete(elementIds)
         await db.halls.delete(id)
       }

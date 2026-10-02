@@ -25,6 +25,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   for (const key of collections) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
+  // corrections 为 v3 新增：旧版本备份允许缺省，按空数组兼容升级
+  if (obj.corrections !== undefined && !Array.isArray(obj.corrections)) errors.push('corrections 字段不是数组')
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const payload: BackupPayload = {
     app: 'gbmuralarch',
@@ -34,19 +36,21 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    repairSteps: obj.repairSteps ?? [],
+    corrections: obj.corrections ?? []
   }
   return { ok: true, errors, payload }
 }
 
-/** 组装当前本地数据的备份对象 */
+/** 组装当前本地数据的备份对象（含层位校订关系） */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
+  const [halls, elements, layers, decays, repairSteps, corrections] = await Promise.all([
     db.halls.toArray(),
     db.elements.toArray(),
     db.layers.toArray(),
     db.decays.toArray(),
-    db.repairSteps.toArray()
+    db.repairSteps.toArray(),
+    db.corrections.toArray()
   ])
   return {
     app: 'gbmuralarch',
@@ -56,7 +60,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    corrections
   }
 }
 
@@ -81,7 +86,8 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      corrections: payload.corrections.length
     }
   }
 }
@@ -96,33 +102,55 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
-/** 导入备份：overwrite=true 时先清空全部表，否则按主键合并（同 id 覆盖） */
+/**
+ * 兼容升级：把旧版本备份规范化到当前结构。
+ * 与 Dexie 的 .upgrade() 迁移同口径 —— 旧备份导入后无需再依赖库级迁移。
+ */
+export function upgradePayload(payload: BackupPayload): BackupPayload {
+  const decays = payload.decays.map((decay) => ({
+    ...decay,
+    repaired: typeof decay.repaired === 'boolean' ? decay.repaired : false,
+    repairedAt:
+      decay.repaired && !decay.repairedAt ? (decay.updatedAt ?? Date.now()) : (decay.repairedAt ?? null)
+  }))
+  const corrections = (payload.corrections ?? []).map((correction) => ({
+    ...correction,
+    failReason: correction.failReason ?? null,
+    appliedAt: correction.appliedAt ?? null
+  }))
+  return { ...payload, dbVersion: DB_VERSION, decays, corrections }
+}
+
+/** 导入备份：overwrite=true 时先清空全部表，否则按主键合并（同 id 覆盖）；旧版本数据先升级再落库 */
 export async function importBackup(
   payload: BackupPayload,
   overwrite: boolean
 ): Promise<Record<string, number>> {
+  const normalized = upgradePayload(payload)
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.corrections],
     async () => {
-      await db.halls.bulkPut(payload.halls)
-      await db.elements.bulkPut(payload.elements)
-      await db.layers.bulkPut(payload.layers)
-      await db.decays.bulkPut(payload.decays)
-      await db.repairSteps.bulkPut(payload.repairSteps)
+      await db.halls.bulkPut(normalized.halls)
+      await db.elements.bulkPut(normalized.elements)
+      await db.layers.bulkPut(normalized.layers)
+      await db.decays.bulkPut(normalized.decays)
+      await db.repairSteps.bulkPut(normalized.repairSteps)
+      await db.corrections.bulkPut(normalized.corrections)
     }
   )
   return {
-    halls: payload.halls.length,
-    elements: payload.elements.length,
-    layers: payload.layers.length,
-    decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    halls: normalized.halls.length,
+    elements: normalized.elements.length,
+    layers: normalized.layers.length,
+    decays: normalized.decays.length,
+    repairSteps: normalized.repairSteps.length,
+    corrections: normalized.corrections.length
   }
 }
 
-/** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
+/** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案；校订关系内的引用同步重映射 */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const hallIdMap = new Map<string, string>()
   const elementIdMap = new Map<string, string>()
@@ -154,7 +182,26 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('step'),
     decayId: decayIdMap.get(step.decayId) ?? step.decayId
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+  const corrections = payload.corrections.map((correction) => ({
+    ...correction,
+    id: createId('cor'),
+    elementId: elementIdMap.get(correction.elementId) ?? correction.elementId,
+    // 原层快照：未生效的校订其原层随备份重映射；已生效的原层已不在 layers 表，保留历史 id 备查
+    sources: correction.sources.map((source) => ({
+      ...source,
+      layerId: layerIdMap.get(source.layerId) ?? source.layerId
+    })),
+    // 目标层位：已生效的随 layers 表重映射；未生效的预生成 id 重新分配，避免重复导入撞号
+    targets: correction.targets.map((target) => ({
+      ...target,
+      layerId: layerIdMap.get(target.layerId) ?? createId('lay')
+    })),
+    assignments: correction.assignments.map((assignment) => ({
+      ...assignment,
+      decayId: decayIdMap.get(assignment.decayId) ?? assignment.decayId
+    }))
+  }))
+  return { ...payload, halls, elements, layers, decays, repairSteps, corrections }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */
